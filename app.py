@@ -1,18 +1,61 @@
 from flask import Flask, render_template, request, send_file
-import requests
+import instaloader
 import tempfile
-import shutil
+import os
 import re
-import json
+import shutil
 
+# --- Load Instagram credentials from environment variables ---
+USERNAME = os.environ.get("IG_USERNAME")
+PASSWORD = os.environ.get("IG_PASSWORD")
+SESSION_FILE = "instaloader.session"
+
+# Initialize Flask
 app = Flask(__name__)
+
+# --- Initialize Instaloader globally ---
+def initialize_instaloader():
+    L = instaloader.Instaloader(
+        dirname_pattern=tempfile.gettempdir(),  # Temp folder
+        filename_pattern="{shortcode}",
+        download_video_thumbnails=False,
+        download_comments=False,
+        save_metadata=False,
+        sleep=True  # Avoid rate-limits
+    )
+
+    if USERNAME and PASSWORD:
+        try:
+            # Load session if exists
+            if os.path.exists(SESSION_FILE):
+                L.load_session_from_file(USERNAME, SESSION_FILE)
+            else:
+                L.login(USERNAME, PASSWORD)
+                L.save_session_to_file(SESSION_FILE)
+            print(f"✅ Logged in as {USERNAME}")
+        except Exception as e:
+            print(f"❌ Instagram login failed: {e}")
+
+    return L
+
+try:
+    INSTALOADER_SESSION = initialize_instaloader()
+except Exception as e:
+    print(f"❌ Failed to initialize Instaloader: {e}")
+    INSTALOADER_SESSION = None
+
+# -------------------------------------------------------------------
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
+
 @app.route('/download', methods=['POST'])
 def download_video():
+    if INSTALOADER_SESSION is None:
+        return "❌ Server Error: Instagram not initialized. Check logs.", 500
+
     url = request.form.get('url')
     if not url:
         return "❌ No URL provided", 400
@@ -25,56 +68,31 @@ def download_video():
             return "⚠️ Invalid Instagram URL", 400
         shortcode = match.group(2)
 
-        # Create temp folder
+        # Temp folder
         temp_dir = tempfile.mkdtemp()
+        L = INSTALOADER_SESSION
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        resp = requests.get(url, headers=headers)
-        if resp.status_code != 200:
-            return f"⚠️ Failed to fetch the post. Status code: {resp.status_code}", 400
+        # Temporarily override dirname_pattern
+        original_dir = L.dirname_pattern
+        L.dirname_pattern = temp_dir
 
-        html = resp.text
+        # Download post (requires authentication)
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        L.download_post(post, target='')
 
-        # --- Parse JSON from window.__additionalDataLoaded ---
-        json_data = None
-        m = re.search(r'window\.__additionalDataLoaded\(".*?",(.*)\);</script>', html)
-        if m:
-            json_text = m.group(1)
-            json_data = json.loads(json_text)
+        L.dirname_pattern = original_dir  # Restore
 
-        if not json_data:
-            return "⚠️ No video data found. Instagram layout may have changed.", 404
+        # Find the video file
+        video_file = None
+        for file in os.listdir(temp_dir):
+            if file.endswith(".mp4"):
+                video_file = os.path.join(temp_dir, file)
+                break
 
-        # Recursive function to find video_url in JSON
-        def find_video_url(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k in ("video_url", "videoUrl"):
-                        return v
-                    found = find_video_url(v)
-                    if found:
-                        return found
-            elif isinstance(obj, list):
-                for item in obj:
-                    found = find_video_url(item)
-                    if found:
-                        return found
-            return None
+        if not video_file:
+            return "⚠️ No video found. It may be a photo or private post.", 404
 
-        video_url = find_video_url(json_data)
-        if not video_url:
-            return "⚠️ No video found. Only public videos are supported.", 404
-
-        # Download video
-        video_resp = requests.get(video_url, stream=True)
-        video_file = f"{temp_dir}/{shortcode}.mp4"
-        with open(video_file, 'wb') as f:
-            for chunk in video_resp.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-
+        # Stream to browser (Chrome download)
         return send_file(
             video_file,
             as_attachment=True,
@@ -82,12 +100,16 @@ def download_video():
             mimetype="video/mp4"
         )
 
+    except instaloader.exceptions.PostNotExistsException:
+        return "⚠️ Post not found or URL incorrect.", 404
+    except instaloader.exceptions.QueryReturnedBadRequestException as e:
+        return f"❌ Download failed: Instagram rejected the query. Error: {e}", 500
     except Exception as e:
-        return f"❌ Internal Server Error: {e}", 500
-
+        return f"⚠️ Unexpected error: {e}", 500
     finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
