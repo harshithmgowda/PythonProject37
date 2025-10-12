@@ -37,27 +37,38 @@ def download_video():
 
         html = resp.text
 
-        # Extract JSON data from <script type="application/ld+json"> or embedded JSON
-        video_url = None
-        json_data_match = re.search(r'window\._sharedData = (.*);</script>', html)
-        if json_data_match:
-            data = json.loads(json_data_match.group(1))
-            try:
-                # Traverse JSON to find video URL
-                media = data["entry_data"]["PostPage"][0]["graphql"]["shortcode_media"]
-                if media.get("is_video"):
-                    video_url = media.get("video_url")
-            except Exception:
-                pass
+        # --- Parse JSON from window.__additionalDataLoaded ---
+        json_data = None
+        m = re.search(r'window\.__additionalDataLoaded\(".*?",(.*)\);</script>', html)
+        if m:
+            json_text = m.group(1)
+            json_data = json.loads(json_text)
 
+        if not json_data:
+            return "⚠️ No video data found. Instagram layout may have changed.", 404
+
+        # Recursive function to find video_url in JSON
+        def find_video_url(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("video_url", "videoUrl"):
+                        return v
+                    found = find_video_url(v)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = find_video_url(item)
+                    if found:
+                        return found
+            return None
+
+        video_url = find_video_url(json_data)
         if not video_url:
-            return "⚠️ No video found. Make sure the post is public and contains a video.", 404
+            return "⚠️ No video found. Only public videos are supported.", 404
 
         # Download video
         video_resp = requests.get(video_url, stream=True)
-        if video_resp.status_code != 200:
-            return f"⚠️ Failed to download video. Status code: {video_resp.status_code}", 500
-
         video_file = f"{temp_dir}/{shortcode}.mp4"
         with open(video_file, 'wb') as f:
             for chunk in video_resp.iter_content(chunk_size=1024):
